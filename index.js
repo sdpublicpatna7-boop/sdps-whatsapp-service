@@ -74,6 +74,9 @@ async function startSock() {
       printQRInTerminal: false,
       browser: ["SDPS Portal", "Chrome", "1.0.0"],
       markOnlineOnConnect: false,
+      // Disable link-preview generation — avoids the optional 'link-preview-js'
+      // module-not-found error that causes WhatsApp to reject messages (error 463).
+      generateHighQualityLinkPreview: false,
     });
 
     sock.ev.on("creds.update", saveCreds);
@@ -101,7 +104,7 @@ async function startSock() {
         console.log("WhatsApp connection closed. loggedOut=", loggedOut, "code=", statusCode);
         starting = false;
         if (!loggedOut) {
-          await sleep(2000);
+          await sleep(3000);
           startSock();
         } else {
           // Session invalidated — clear so a fresh QR is produced on next start.
@@ -112,23 +115,29 @@ async function startSock() {
     });
   } catch (e) {
     console.error("startSock error:", e.message);
-  } finally {
-    starting = false;
+    starting = false; // allow retry on unexpected startup error
   }
+  // NOTE: do NOT reset `starting` in a finally block here — the socket lives
+  // beyond this function. `starting` is reset inside connection.update "close"
+  // to prevent duplicate concurrent sockets during reconnect.
 }
 
 /** Send a text and/or media message to one JID. */
 async function sendMessage(jid, message, media) {
+  // generateLinkPreviewIfAbsent:false prevents Baileys from trying to load
+  // the optional 'link-preview-js' module, which is not installed server-side
+  // and causes WhatsApp to reject messages with error 463.
+  const opts = { generateLinkPreviewIfAbsent: false };
   if (media && media.mediaBase64 && media.mediaType) {
     const buffer = Buffer.from(media.mediaBase64, "base64");
     if (media.mediaType === "image") {
-      return sock.sendMessage(jid, { image: buffer, caption: message || "" });
+      return sock.sendMessage(jid, { image: buffer, caption: message || "" }, opts);
     }
     if (media.mediaType === "video") {
-      return sock.sendMessage(jid, { video: buffer, caption: message || "" });
+      return sock.sendMessage(jid, { video: buffer, caption: message || "" }, opts);
     }
   }
-  return sock.sendMessage(jid, { text: message || "" });
+  return sock.sendMessage(jid, { text: message || "" }, opts);
 }
 
 // ── HTTP API ─────────────────────────────────────────────────────────────────
