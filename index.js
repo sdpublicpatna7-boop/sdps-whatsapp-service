@@ -13,16 +13,16 @@
  * Bulk sends are paced with a configurable delay (default 2000ms) to reduce
  * WhatsApp ban risk, and support {name} personalisation in the message.
  */
-const express = require("express");
-const qrcode = require("qrcode");
-const pino = require("pino");
-const { Boom } = require("@hapi/boom");
-const {
-  default: makeWASocket,
+import express from "express";
+import qrcode from "qrcode";
+import pino from "pino";
+import { Boom } from "@hapi/boom";
+import makeWASocket, {
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
-} = require("@whiskeysockets/baileys");
+  makeCacheableSignalKeyStore,
+} from "baileys";
 
 const PORT = process.env.PORT || 3001;
 const WA_API_SECRET = process.env.WA_API_SECRET || "";
@@ -69,13 +69,15 @@ async function startSock() {
 
     sock = makeWASocket({
       version,
-      auth: state,
+      auth: {
+        creds: state.creds,
+        keys: makeCacheableSignalKeyStore(state.keys, logger),
+      },
       logger,
       printQRInTerminal: false,
       browser: ["SDPS Portal", "Chrome", "1.0.0"],
       markOnlineOnConnect: false,
-      // Disable link-preview generation — avoids the optional 'link-preview-js'
-      // module-not-found error that causes WhatsApp to reject messages (error 463).
+      // Belt-and-suspenders: skip auto link-preview generation on send.
       generateHighQualityLinkPreview: false,
     });
 
@@ -124,9 +126,9 @@ async function startSock() {
 
 /** Send a text and/or media message to one JID. */
 async function sendMessage(jid, message, media) {
-  // generateLinkPreviewIfAbsent:false prevents Baileys from trying to load
-  // the optional 'link-preview-js' module, which is not installed server-side
-  // and causes WhatsApp to reject messages with error 463.
+  // generateLinkPreviewIfAbsent:false skips link-preview generation on send.
+  // Note: error 463 ("reach-out time-lock") on cold contacts is fixed by
+  // Baileys v7's built-in tctoken/cstoken support, not by this option.
   const opts = { generateLinkPreviewIfAbsent: false };
   if (media && media.mediaBase64 && media.mediaType) {
     const buffer = Buffer.from(media.mediaBase64, "base64");
