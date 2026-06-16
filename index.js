@@ -202,11 +202,31 @@ app.get("/status", (req, res) => {
 });
 
 app.post("/disconnect", async (req, res) => {
+  // IMPORTANT: sock.logout() tells WhatsApp's servers this device is logging
+  // out — it invalidates the session server-side regardless of whether we
+  // also erase the local/Mongo creds. That always forces a brand-new device
+  // pairing on the next connect. Repeated re-pairing is exactly the pattern
+  // that triggers WhatsApp's anti-abuse reach-out lock (error 463), so a
+  // logout must be explicit, never an accidental side effect of clicking
+  // "disconnect" to fix a stuck connection.
+  //
+  // Send {"confirm": true} to perform a real logout + erase the saved
+  // session (use this only when you intend to re-pair with a fresh QR).
+  // Without it, this just closes and reopens the socket using the SAME
+  // saved session — safe to click any time, no re-pairing required.
+  const hardLogout = req.body && req.body.confirm === true;
+
   try {
     if (sock) {
-      try { await sock.logout(); } catch (e) { /* ignore */ }
+      try {
+        if (hardLogout) {
+          await sock.logout();
+        } else {
+          sock.end(); // local close only — keeps the session valid
+        }
+      } catch (e) { /* ignore */ }
     }
-    if (removeCredsFn) {
+    if (hardLogout && removeCredsFn) {
       try { await removeCredsFn(); } catch (e) { /* ignore */ }
     }
   } finally {
@@ -214,9 +234,14 @@ app.post("/disconnect", async (req, res) => {
     meUser = null;
     currentQR = null;
     sock = null;
-    // Recreate a socket so a fresh QR appears.
     await startSock();
-    res.json({ status: "disconnected" });
+    res.json({
+      status: "disconnected",
+      sessionWiped: hardLogout,
+      note: hardLogout
+        ? "Logged out and erased the saved session — scan a new QR code to reconnect."
+        : "Closed the connection locally; the saved session was kept and should reconnect automatically without a new QR scan.",
+    });
   }
 });
 
