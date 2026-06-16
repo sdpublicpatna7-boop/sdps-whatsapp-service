@@ -220,14 +220,31 @@ app.post("/disconnect", async (req, res) => {
     if (sock) {
       try {
         if (hardLogout) {
-          await sock.logout();
+          // Wait at most 3 seconds for WhatsApp servers to acknowledge logout
+          await Promise.race([
+            sock.logout(),
+            new Promise((_, reject) => setTimeout(() => reject(new Error("Logout timeout")), 3000))
+          ]);
         } else {
           sock.end(); // local close only — keeps the session valid
         }
-      } catch (e) { /* ignore */ }
+      } catch (e) {
+        console.log("sock.logout() error/timeout (ignored):", e.message);
+      }
     }
-    if (hardLogout && removeCredsFn) {
-      try { await removeCredsFn(); } catch (e) { /* ignore */ }
+    if (hardLogout) {
+      if (removeCredsFn) {
+        try { await removeCredsFn(); } catch (e) { /* ignore */ }
+      } else {
+        // Fallback: erase local auth_state folder if we are not using MongoDB
+        try {
+          const authDir = path.resolve(AUTH_DIR);
+          if (fs.existsSync(authDir)) {
+            fs.rmSync(authDir, { recursive: true, force: true });
+            console.log("Local auth state cleared:", authDir);
+          }
+        } catch (e) { /* ignore */ }
+      }
     }
   } finally {
     isConnected = false;
