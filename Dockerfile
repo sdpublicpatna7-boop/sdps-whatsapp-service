@@ -1,6 +1,6 @@
 FROM node:20-slim
  
-# git is required by @whiskeysockets/baileys which resolves a git dependency at install time.
+# git is required by baileys which may resolve a git dependency at install time.
 RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
  
 WORKDIR /app
