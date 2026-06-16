@@ -15,6 +15,7 @@
     "@hapi/boom": "^10.0.1",
     "baileys": "7.0.0-rc13",
     "express": "^4.19.2",
+    "mongodb": "^6.10.0",
     "pino": "^9.3.2",
     "qrcode": "^1.5.4",
     "link-preview-js": "^3.0.5"
