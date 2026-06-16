@@ -24,10 +24,13 @@ import makeWASocket, {
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
 } from "baileys";
+import { useMongoAuthState } from "./mongoAuthState.js";
 
 const PORT = process.env.PORT || 3001;
 const WA_API_SECRET = process.env.WA_API_SECRET || "";
 const AUTH_DIR = process.env.WA_AUTH_DIR || "./auth_state";
+const MONGODB_URL = process.env.MONGODB_URL || "";
+const WA_SESSION_ID = process.env.WA_SESSION_ID || "sdps-main";
 const DEFAULT_DELAY_MS = parseInt(process.env.WA_BULK_DELAY_MS || "2000", 10);
 
 if (!WA_API_SECRET || WA_API_SECRET === "change-me-secret") {
@@ -43,6 +46,7 @@ let currentQR = null;      // base64 PNG data URL while waiting to be scanned
 let isConnected = false;
 let meUser = null;
 let starting = false;
+let removeCredsFn = null; // set when using Mongo-backed auth; used on /disconnect
 
 let bulkProgress = { total: 0, sent: 0, failed: 0, running: false, errors: [] };
 let stopRequested = false;
@@ -65,21 +69,37 @@ async function startSock() {
   if (starting) return;
   starting = true;
   try {
-    // IMPORTANT: WA_AUTH_DIR must point to a Render persistent disk mount.
-    // Without one, this directory (and the WhatsApp device identity in it)
-    // is wiped on every deploy/restart, forcing a brand-new device pairing
-    // each time. Repeatedly re-pairing a "new device" and immediately
-    // sending messages is exactly the pattern that triggers WhatsApp's
-    // anti-abuse reach-out lock (error 463), independent of Baileys version.
-    if (!fs.existsSync(AUTH_DIR)) {
-      console.warn(
-        `WARNING: ${AUTH_DIR} does not exist yet. If this directory is not ` +
-        `on a persistent disk, every deploy will force a new QR pairing ` +
-        `and may trigger WhatsApp error 463 on sends.`
-      );
+    let state, saveCreds;
+
+    if (MONGODB_URL) {
+      // Preferred path: persists across redeploys without needing a paid
+      // Render disk. The same WhatsApp device identity is reused every
+      // restart, avoiding repeated "new device" pairings that can trigger
+      // WhatsApp's anti-abuse reach-out lock (error 463).
+      const mongoState = await useMongoAuthState(MONGODB_URL, WA_SESSION_ID);
+      state = mongoState.state;
+      saveCreds = mongoState.saveCreds;
+      removeCredsFn = mongoState.removeCreds;
+      console.log("Using MongoDB-backed auth state (session:", WA_SESSION_ID, ")");
+    } else {
+      // Fallback: local filesystem. WARNING — on Render's free/starter plan
+      // (no persistent disk) this directory is wiped on every deploy/restart,
+      // forcing a brand-new device pairing each time, which is exactly the
+      // pattern that triggers WhatsApp's anti-abuse reach-out lock (error 463).
+      if (!fs.existsSync(AUTH_DIR)) {
+        console.warn(
+          `WARNING: ${AUTH_DIR} does not exist yet and MONGODB_URL is not set. ` +
+          `If this directory is not on a persistent disk, every deploy will ` +
+          `force a new QR pairing and may trigger WhatsApp error 463 on sends. ` +
+          `Set MONGODB_URL to persist the session in MongoDB instead.`
+        );
+      }
+      const fileState = await useMultiFileAuthState(AUTH_DIR);
+      state = fileState.state;
+      saveCreds = fileState.saveCreds;
+      removeCredsFn = null;
     }
 
-    const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
     const { version } = await fetchLatestBaileysVersion();
 
     sock = makeWASocket({
@@ -185,6 +205,9 @@ app.post("/disconnect", async (req, res) => {
   try {
     if (sock) {
       try { await sock.logout(); } catch (e) { /* ignore */ }
+    }
+    if (removeCredsFn) {
+      try { await removeCredsFn(); } catch (e) { /* ignore */ }
     }
   } finally {
     isConnected = false;
