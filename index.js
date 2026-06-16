@@ -16,6 +16,7 @@
 import express from "express";
 import qrcode from "qrcode";
 import pino from "pino";
+import fs from "fs";
 import { Boom } from "@hapi/boom";
 import makeWASocket, {
   useMultiFileAuthState,
@@ -64,6 +65,20 @@ async function startSock() {
   if (starting) return;
   starting = true;
   try {
+    // IMPORTANT: WA_AUTH_DIR must point to a Render persistent disk mount.
+    // Without one, this directory (and the WhatsApp device identity in it)
+    // is wiped on every deploy/restart, forcing a brand-new device pairing
+    // each time. Repeatedly re-pairing a "new device" and immediately
+    // sending messages is exactly the pattern that triggers WhatsApp's
+    // anti-abuse reach-out lock (error 463), independent of Baileys version.
+    if (!fs.existsSync(AUTH_DIR)) {
+      console.warn(
+        `WARNING: ${AUTH_DIR} does not exist yet. If this directory is not ` +
+        `on a persistent disk, every deploy will force a new QR pairing ` +
+        `and may trigger WhatsApp error 463 on sends.`
+      );
+    }
+
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
     const { version } = await fetchLatestBaileysVersion();
 
