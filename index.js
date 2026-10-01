@@ -2,10 +2,12 @@
  * SDPS WhatsApp microservice (Baileys)
  * ------------------------------------
  * Exposes a small HTTP API consumed by the FastAPI backend:
- *   GET  /status      -> { connected, qr, user, bulkProgress }
- *   POST /disconnect  -> logout + reset session
- *   POST /send-text   -> { phone, message, mediaBase64?, mediaMime?, mediaType? }
- *   POST /send-bulk   -> { contacts:[{phone,name}], message, mediaBase64?, mediaMime?, mediaType?, delayMs }
+ *   GET  /status        -> { connected, qr, user, bulkProgress, uptimeSec }
+ *   POST /disconnect    -> logout + wipe auth + generate fresh QR
+ *   POST /reset-session -> force wipe stale session + generate fresh QR
+ *   POST /pairing-code  -> { phone } -> { success, pairingCode, phone }
+ *   POST /send-text     -> { phone, message, mediaBase64?, mediaMime?, mediaType? }
+ *   POST /send-bulk     -> { contacts:[{phone,name}], message, mediaBase64?, mediaMime?, mediaType?, delayMs }
  *   GET  /bulk-progress (via /status.bulkProgress)
  *   POST /stop-bulk
  *
@@ -13,24 +15,24 @@
  * Bulk sends are paced with a configurable delay (default 2000ms) to reduce
  * WhatsApp ban risk, and support {name} personalisation in the message.
  */
-import express from "express";
-import qrcode from "qrcode";
-import pino from "pino";
-import fs from "fs";
-import { Boom } from "@hapi/boom";
-import makeWASocket, {
+const express = require("express");
+const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
+const qrcode = require("qrcode");
+const pino = require("pino");
+const { Boom } = require("@hapi/boom");
+const {
+  default: makeWASocket,
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
-  makeCacheableSignalKeyStore,
-} from "baileys";
-import { useMongoAuthState } from "./mongoAuthState.js";
+  Browsers,
+} = require("@whiskeysockets/baileys");
 
 const PORT = process.env.PORT || 3001;
 const WA_API_SECRET = process.env.WA_API_SECRET || "";
 const AUTH_DIR = process.env.WA_AUTH_DIR || "./auth_state";
-const MONGODB_URL = process.env.MONGODB_URL || "";
-const WA_SESSION_ID = process.env.WA_SESSION_ID || "sdps-main";
 const DEFAULT_DELAY_MS = parseInt(process.env.WA_BULK_DELAY_MS || "2000", 10);
 
 if (!WA_API_SECRET || WA_API_SECRET === "change-me-secret") {
@@ -46,12 +48,30 @@ let currentQR = null;      // base64 PNG data URL while waiting to be scanned
 let isConnected = false;
 let meUser = null;
 let starting = false;
-let removeCredsFn = null; // set when using Mongo-backed auth; used on /disconnect
 
 let bulkProgress = { total: 0, sent: 0, failed: 0, running: false, errors: [] };
 let stopRequested = false;
+let disconnecting = false;  // Flag to prevent close handler from interfering during disconnect
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** Clean up persisted Baileys auth state folder */
+function cleanAuthDir() {
+  const paths = [
+    path.resolve(AUTH_DIR),
+    path.join(__dirname, "auth_state"),
+  ];
+  for (const p of paths) {
+    try {
+      if (fs.existsSync(p)) {
+        fs.rmSync(p, { recursive: true, force: true });
+        console.log("[WhatsApp] Cleaned auth state directory:", p);
+      }
+    } catch (e) {
+      console.warn("[WhatsApp] Could not clean auth state at:", p, e.message);
+    }
+  }
+}
 
 /** Normalise an Indian-style phone number to a WhatsApp JID. */
 function toJid(raw) {
@@ -66,127 +86,148 @@ function toJid(raw) {
 }
 
 async function startSock() {
-  if (starting) return;
+  if (starting) {
+    console.log("[WhatsApp] startSock already in progress, skipping duplicate call.");
+    return;
+  }
   starting = true;
-  try {
-    let state, saveCreds;
 
-    if (MONGODB_URL) {
-      // Preferred path: persists across redeploys without needing a paid
-      // Render disk. The same WhatsApp device identity is reused every
-      // restart, avoiding repeated "new device" pairings that can trigger
-      // WhatsApp's anti-abuse reach-out lock (error 463).
-      const mongoState = await useMongoAuthState(MONGODB_URL, WA_SESSION_ID);
-      state = mongoState.state;
-      saveCreds = mongoState.saveCreds;
-      removeCredsFn = mongoState.removeCreds;
-      console.log("Using MongoDB-backed auth state (session:", WA_SESSION_ID, ")");
-    } else {
-      // Fallback: local filesystem. WARNING — on Render's free/starter plan
-      // (no persistent disk) this directory is wiped on every deploy/restart,
-      // forcing a brand-new device pairing each time, which is exactly the
-      // pattern that triggers WhatsApp's anti-abuse reach-out lock (error 463).
-      if (!fs.existsSync(AUTH_DIR)) {
-        console.warn(
-          `WARNING: ${AUTH_DIR} does not exist yet and MONGODB_URL is not set. ` +
-          `If this directory is not on a persistent disk, every deploy will ` +
-          `force a new QR pairing and may trigger WhatsApp error 463 on sends. ` +
-          `Set MONGODB_URL to persist the session in MongoDB instead.`
-        );
-      }
-      const fileState = await useMultiFileAuthState(AUTH_DIR);
-      state = fileState.state;
-      saveCreds = fileState.saveCreds;
-      removeCredsFn = null;
+  try {
+    // 1. Clean up old socket if it exists
+    if (sock) {
+      try { sock.ev.removeAllListeners(); } catch (e) { /* ok */ }
+      try { sock.ws?.close(); } catch (e) { /* ok */ }
+      try { sock.end?.(undefined); } catch (e) { /* ok */ }
+      sock = null;
     }
 
-    const { version } = await fetchLatestBaileysVersion();
+    const resolvedAuthDir = path.resolve(AUTH_DIR);
+    if (!fs.existsSync(resolvedAuthDir)) {
+      fs.mkdirSync(resolvedAuthDir, { recursive: true });
+    }
+
+    const { state, saveCreds } = await useMultiFileAuthState(resolvedAuthDir);
+
+    let version = [2, 3000, 1015901307];
+    try {
+      const v = await fetchLatestBaileysVersion();
+      if (v?.version) version = v.version;
+    } catch (e) {
+      console.warn("[WhatsApp] Could not fetch latest Baileys version, using fallback:", e.message);
+    }
 
     sock = makeWASocket({
       version,
-      auth: {
-        creds: state.creds,
-        keys: makeCacheableSignalKeyStore(state.keys, logger),
-      },
+      auth: state,
       logger,
-      printQRInTerminal: false,
-      browser: ["SDPS Portal", "Chrome", "1.0.0"],
+      printQRInTerminal: true,
+      browser: Browsers.ubuntu("Chrome"),
       markOnlineOnConnect: false,
-      // Belt-and-suspenders: skip auto link-preview generation on send.
+      syncFullHistory: false,
       generateHighQualityLinkPreview: false,
+      connectTimeoutMs: 60000,
+      keepAliveIntervalMs: 25000,
+      getMessage: async () => ({ conversation: "" }),
     });
 
     sock.ev.on("creds.update", saveCreds);
 
     sock.ev.on("connection.update", async (update) => {
       const { connection, lastDisconnect, qr } = update;
+
       if (qr) {
         try {
-          currentQR = await qrcode.toDataURL(qr);
+          currentQR = await qrcode.toDataURL(qr, {
+            margin: 2,
+            scale: 8,
+            color: { dark: "#0f172a", light: "#ffffff" },
+          });
+          console.log("[WhatsApp] Fresh QR code generated and ready to scan!");
         } catch (e) {
+          console.error("[WhatsApp] QR generation error:", e.message);
           currentQR = null;
         }
       }
+
       if (connection === "open") {
         isConnected = true;
         currentQR = null;
         meUser = sock?.user || null;
-        console.log("WhatsApp connected as", meUser?.id);
+        console.log("[WhatsApp] Successfully connected as:", meUser?.id || meUser?.name);
       }
+
       if (connection === "close") {
         isConnected = false;
         meUser = null;
-        const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
-        const loggedOut = statusCode === DisconnectReason.loggedOut;
-        console.log("WhatsApp connection closed. loggedOut=", loggedOut, "code=", statusCode);
+        currentQR = null;
+
+        if (disconnecting) {
+          console.log("[WhatsApp] Socket closed during intentional disconnect/reset.");
+          return;
+        }
+
+        const boom = new Boom(lastDisconnect?.error);
+        const statusCode = boom?.output?.statusCode;
+        const isLoggedOut = statusCode === DisconnectReason.loggedOut;
+        const isBadSession = statusCode === DisconnectReason.badSession;
+
+        console.log(`[WhatsApp] Connection closed. StatusCode: ${statusCode} (loggedOut=${isLoggedOut})`);
+
         starting = false;
-        if (!loggedOut) {
-          await sleep(3000);
+
+        if (isLoggedOut || isBadSession || statusCode === 401 || statusCode === 403) {
+          console.log("[WhatsApp] Session invalidated/logged out. Wiping stale auth state and generating fresh QR...");
+          cleanAuthDir();
+          await sleep(2000);
           startSock();
         } else {
-          // Session invalidated — clear so a fresh QR is produced on next start.
-          currentQR = null;
-          sock = null;
+          console.log("[WhatsApp] Connection dropped or QR refreshed. Reconnecting in 2.5s...");
+          await sleep(2500);
+          startSock();
         }
       }
     });
   } catch (e) {
-    console.error("startSock error:", e.message);
-    starting = false; // allow retry on unexpected startup error
+    console.error("[WhatsApp] startSock error:", e.message);
+  } finally {
+    starting = false;
   }
-  // NOTE: do NOT reset `starting` in a finally block here — the socket lives
-  // beyond this function. `starting` is reset inside connection.update "close"
-  // to prevent duplicate concurrent sockets during reconnect.
 }
 
 /** Send a text and/or media message to one JID. */
 async function sendMessage(jid, message, media) {
-  // generateLinkPreviewIfAbsent:false skips link-preview generation on send.
-  // Note: error 463 ("reach-out time-lock") on cold contacts is fixed by
-  // Baileys v7's built-in tctoken/cstoken support, not by this option.
-  const opts = { generateLinkPreviewIfAbsent: false };
   if (media && media.mediaBase64 && media.mediaType) {
     const buffer = Buffer.from(media.mediaBase64, "base64");
     if (media.mediaType === "image") {
-      return sock.sendMessage(jid, { image: buffer, caption: message || "" }, opts);
+      return sock.sendMessage(jid, { image: buffer, caption: message || "" });
     }
     if (media.mediaType === "video") {
-      return sock.sendMessage(jid, { video: buffer, caption: message || "" }, opts);
+      return sock.sendMessage(jid, { video: buffer, caption: message || "" });
     }
   }
-  return sock.sendMessage(jid, { text: message || "" }, opts);
+  return sock.sendMessage(jid, { text: message || "" });
 }
 
 // ── HTTP API ─────────────────────────────────────────────────────────────────
 const app = express();
-app.use(express.json({ limit: "60mb" }));
+// 20mb accommodates base64-encoded media (~15mb raw) without allowing memory exhaustion
+app.use(express.json({ limit: process.env.WA_BODY_LIMIT || "20mb" }));
 
 // Public keep-alive endpoint (no secret) — for the pinger / uptime monitors.
 app.get("/ping", (req, res) => res.json({ status: "alive", connected: isConnected }));
 
-// Shared-secret auth for every other route.
+// Shared-secret auth for every other route (timing-safe comparison).
+const secretBuf = Buffer.from(WA_API_SECRET);
+const secretMatches = (provided) => {
+  const providedBuf = Buffer.from(String(provided || ""));
+  return (
+    providedBuf.length === secretBuf.length &&
+    crypto.timingSafeEqual(providedBuf, secretBuf)
+  );
+};
+
 app.use((req, res, next) => {
-  if (req.headers["x-wa-secret"] !== WA_API_SECRET) {
+  if (!secretMatches(req.headers["x-wa-secret"])) {
     return res.status(401).json({ error: "Unauthorized" });
   }
   next();
@@ -198,67 +239,78 @@ app.get("/status", (req, res) => {
     qr: currentQR,
     user: meUser ? { id: meUser.id, name: meUser.name } : null,
     bulkProgress,
+    uptimeSec: Math.floor(process.uptime()),
   });
 });
 
-app.post("/disconnect", async (req, res) => {
-  // IMPORTANT: sock.logout() tells WhatsApp's servers this device is logging
-  // out — it invalidates the session server-side regardless of whether we
-  // also erase the local/Mongo creds. That always forces a brand-new device
-  // pairing on the next connect. Repeated re-pairing is exactly the pattern
-  // that triggers WhatsApp's anti-abuse reach-out lock (error 463), so a
-  // logout must be explicit, never an accidental side effect of clicking
-  // "disconnect" to fix a stuck connection.
-  //
-  // Send {"confirm": true} to perform a real logout + erase the saved
-  // session (use this only when you intend to re-pair with a fresh QR).
-  // Without it, this just closes and reopens the socket using the SAME
-  // saved session — safe to click any time, no re-pairing required.
-  const hardLogout = req.body && req.body.confirm === true;
+app.post("/reset-session", async (req, res) => {
+  console.log("[WhatsApp] ===== RESET SESSION REQUESTED =====");
+  disconnecting = true;
+  isConnected = false;
+  meUser = null;
+  currentQR = null;
+  starting = false;
+
+  if (sock) {
+    try { sock.ev.removeAllListeners(); } catch (e) { /* ok */ }
+    try { sock.ws?.close(); } catch (e) { /* ok */ }
+    try { sock.end?.(undefined); } catch (e) { /* ok */ }
+    sock = null;
+  }
+
+  cleanAuthDir();
+  await sleep(1500);
+
+  disconnecting = false;
+  startSock();
+
+  // Wait briefly (up to 3s) to return fresh QR immediately if available
+  for (let i = 0; i < 6; i++) {
+    if (currentQR) break;
+    await sleep(500);
+  }
+
+  res.json({
+    status: "reset_complete",
+    message: "Fresh QR session initialized.",
+    qr: currentQR,
+  });
+});
+
+app.post("/disconnect", (req, res, next) => {
+  // Disconnect behaves identically to reset-session: wipes stale state & restarts fresh QR
+  req.url = "/reset-session";
+  app.handle(req, res, next);
+});
+
+app.post("/pairing-code", async (req, res) => {
+  if (isConnected) {
+    return res.status(400).json({ error: "WhatsApp is already connected." });
+  }
+  const { phone } = req.body || {};
+  let digits = String(phone || "").replace(/\D/g, "");
+  if (digits.length === 10) digits = "91" + digits;
+  if (digits.length === 11 && digits.startsWith("0")) digits = "91" + digits.slice(1);
+
+  if (digits.length < 11 || digits.length > 15) {
+    return res.status(400).json({ error: "Invalid mobile number. Please enter a valid 10-digit Indian phone number." });
+  }
+
+  if (!sock) {
+    await startSock();
+    await sleep(2000);
+  }
 
   try {
-    if (sock) {
-      try {
-        if (hardLogout) {
-          // Wait at most 3 seconds for WhatsApp servers to acknowledge logout
-          await Promise.race([
-            sock.logout(),
-            new Promise((_, reject) => setTimeout(() => reject(new Error("Logout timeout")), 3000))
-          ]);
-        } else {
-          sock.end(); // local close only — keeps the session valid
-        }
-      } catch (e) {
-        console.log("sock.logout() error/timeout (ignored):", e.message);
-      }
+    if (typeof sock?.requestPairingCode !== "function") {
+      return res.status(500).json({ error: "Pairing code is not supported by the current socket." });
     }
-    if (hardLogout) {
-      if (removeCredsFn) {
-        try { await removeCredsFn(); } catch (e) { /* ignore */ }
-      } else {
-        // Fallback: erase local auth_state folder if we are not using MongoDB
-        try {
-          const authDir = path.resolve(AUTH_DIR);
-          if (fs.existsSync(authDir)) {
-            fs.rmSync(authDir, { recursive: true, force: true });
-            console.log("Local auth state cleared:", authDir);
-          }
-        } catch (e) { /* ignore */ }
-      }
-    }
-  } finally {
-    isConnected = false;
-    meUser = null;
-    currentQR = null;
-    sock = null;
-    await startSock();
-    res.json({
-      status: "disconnected",
-      sessionWiped: hardLogout,
-      note: hardLogout
-        ? "Logged out and erased the saved session — scan a new QR code to reconnect."
-        : "Closed the connection locally; the saved session was kept and should reconnect automatically without a new QR scan.",
-    });
+    const code = await sock.requestPairingCode(digits);
+    console.log(`[WhatsApp] Pairing code generated for ${digits}: ${code}`);
+    res.json({ success: true, pairingCode: code, phone: digits });
+  } catch (e) {
+    console.error("[WhatsApp] Pairing code generation error:", e.message);
+    res.status(500).json({ error: `Could not generate pairing code: ${e.message}` });
   }
 });
 
@@ -306,12 +358,19 @@ app.post("/send-bulk", async (req, res) => {
       const personalised = c.message
         ? c.message
         : (message || "").replace(/\{name\}/g, c.name || "");
+      
+      const contactMedia = (c.mediaBase64) ? {
+        mediaBase64: c.mediaBase64,
+        mediaMime: c.mediaMime || "image/jpeg",
+        mediaType: c.mediaType || "image"
+      } : media;
+
       if (!jid) {
         bulkProgress.failed++;
         bulkProgress.errors.push(`${c.phone}: invalid number`);
       } else {
         try {
-          await sendMessage(jid, personalised, media);
+          await sendMessage(jid, personalised, contactMedia);
           bulkProgress.sent++;
         } catch (e) {
           bulkProgress.failed++;
@@ -350,7 +409,6 @@ function startKeepAlive() {
     if (selfUrl) targets.push(`${selfUrl}/ping`);
     if (backendUrl) targets.push(`${backendUrl}/api/ping`);
     targets.forEach((u) => {
-      // global fetch is available on Node 18+
       fetch(u).catch(() => { /* non-fatal */ });
     });
   };
