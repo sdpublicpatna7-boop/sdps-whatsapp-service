@@ -32,6 +32,7 @@ const makeWASocket = baileysPkg.default || baileysPkg.makeWASocket || baileysPkg
 const {
   useMultiFileAuthState,
   DisconnectReason,
+  fetchLatestBaileysVersion,
   Browsers,
 } = baileysPkg;
 
@@ -113,14 +114,23 @@ async function startSock() {
 
     const { state, saveCreds } = await useMultiFileAuthState(resolvedAuthDir);
 
-    // Use standard macOS Desktop profile for stable multi-device pairing signatures
-    const browserConfig = Browsers?.macOS ? Browsers.macOS("Desktop") : ["Mac OS", "Desktop", "14.4.1"];
+    let version = [2, 3000, 1015901307];
+    try {
+      const v = await fetchLatestBaileysVersion();
+      if (v?.version) version = v.version;
+    } catch (e) {
+      console.warn("[WhatsApp] Version fetch fallback:", e.message);
+    }
+
+    const browserConfig = Browsers?.ubuntu ? Browsers.ubuntu("Chrome") : ["Ubuntu", "Chrome", "22.04.4"];
 
     sock = makeWASocket({
+      version,
       auth: state,
       logger,
       printQRInTerminal: false,
       browser: browserConfig,
+      qrTimeout: 60000,
       markOnlineOnConnect: false,
       syncFullHistory: false,
       generateHighQualityLinkPreview: false,
