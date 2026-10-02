@@ -33,6 +33,7 @@ const {
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
+  fetchLatestWaWebVersion,
   Browsers,
 } = baileysPkg;
 
@@ -114,15 +115,21 @@ async function startSock() {
 
     const { state, saveCreds } = await useMultiFileAuthState(resolvedAuthDir);
 
-    let version = [2, 3000, 1015901307];
+    let version = [2, 3000, 1019143644];
     try {
-      const v = await fetchLatestBaileysVersion();
-      if (v?.version) version = v.version;
+      if (typeof fetchLatestWaWebVersion === "function") {
+        const v = await fetchLatestWaWebVersion();
+        if (v?.version) version = v.version;
+      } else if (typeof fetchLatestBaileysVersion === "function") {
+        const v = await fetchLatestBaileysVersion();
+        if (v?.version) version = v.version;
+      }
     } catch (e) {
       console.warn("[WhatsApp] Version fetch fallback:", e.message);
     }
 
-    const browserConfig = Browsers?.ubuntu ? Browsers.ubuntu("Chrome") : ["Ubuntu", "Chrome", "22.04.4"];
+    // Browsers.macOS("Desktop") provides the official desktop handshake tuple
+    const browserConfig = Browsers?.macOS ? Browsers.macOS("Desktop") : ["Mac OS", "Desktop", "14.4.1"];
 
     sock = makeWASocket({
       version,
@@ -135,7 +142,10 @@ async function startSock() {
       syncFullHistory: false,
       generateHighQualityLinkPreview: false,
       connectTimeoutMs: 60000,
+      defaultQueryTimeoutMs: 60000,
       keepAliveIntervalMs: 25000,
+      retryRequestDelayMs: 500,
+      maxMsgRetryCount: 5,
       getMessage: async () => ({ conversation: "" }),
     });
 
@@ -168,7 +178,6 @@ async function startSock() {
       if (connection === "close") {
         isConnected = false;
         meUser = null;
-        currentQR = null;
 
         if (disconnecting) {
           console.log("[WhatsApp] Socket closed during intentional disconnect/reset.");
@@ -176,22 +185,26 @@ async function startSock() {
         }
 
         const boom = new Boom(lastDisconnect?.error);
-        const statusCode = boom?.output?.statusCode;
+        const statusCode = boom?.output?.statusCode || lastDisconnect?.error?.output?.statusCode;
         const isLoggedOut = statusCode === DisconnectReason.loggedOut;
-        const isBadSession = statusCode === DisconnectReason.badSession;
 
         console.log(`[WhatsApp] Connection closed. StatusCode: ${statusCode} (loggedOut=${isLoggedOut})`);
 
         starting = false;
 
-        if (isLoggedOut || isBadSession || statusCode === 401 || statusCode === 403 || statusCode === 500) {
-          console.log("[WhatsApp] Auth state reset or signature mismatch. Wiping stale state and generating fresh QR...");
+        if (isLoggedOut) {
+          console.log("[WhatsApp] Device was logged out. Cleaning auth directory and generating fresh session...");
           cleanAuthDir();
+          currentQR = null;
           await sleep(2000);
           startSock();
+        } else if (statusCode === DisconnectReason.restartRequired || statusCode === 515) {
+          console.log("[WhatsApp] Restart required (handshake/pairing completed). Restarting socket with saved creds...");
+          await sleep(1000);
+          startSock();
         } else {
-          console.log("[WhatsApp] Connection dropped or QR refreshed. Reconnecting in 2.5s...");
-          await sleep(2500);
+          console.log(`[WhatsApp] Connection dropped (status code: ${statusCode}). Reconnecting in 3s...`);
+          await sleep(3000);
           startSock();
         }
       }
@@ -314,9 +327,10 @@ app.post("/pairing-code", async (req, res) => {
     if (typeof sock?.requestPairingCode !== "function") {
       return res.status(500).json({ error: "Pairing code is not supported by the current socket." });
     }
-    const code = await sock.requestPairingCode(digits);
-    console.log(`[WhatsApp] Pairing code generated for ${digits}: ${code}`);
-    res.json({ success: true, pairingCode: code, phone: digits });
+    const rawCode = await sock.requestPairingCode(digits);
+    const formattedCode = rawCode?.match(/.{1,4}/g)?.join("-") || rawCode;
+    console.log(`[WhatsApp] Pairing code generated for ${digits}: ${formattedCode}`);
+    res.json({ success: true, pairingCode: formattedCode, rawCode, phone: digits });
   } catch (e) {
     console.error("[WhatsApp] Pairing code generation error:", e.message);
     res.status(500).json({ error: `Could not generate pairing code: ${e.message}` });
